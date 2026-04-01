@@ -5,12 +5,12 @@ Provides API endpoints for demand prediction, inventory status, restock recommen
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import Optional
 from datetime import datetime
-import pandas as pd
 import logging
+import os
 
-from data_generator import DataGenerator, get_sample_data
+from data_generator import get_sample_data
 from model import DemandPredictor
 from inventory import InventoryOptimizer, RestockingEngine
 from transfer import TransferOptimizer, ExpiryManager
@@ -40,12 +40,15 @@ optimizer = None
 restock_engine = None
 transfer_optimizer = None
 expiry_manager = None
+_initialized = False
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the system on startup."""
-    global data, predictor, optimizer, restock_engine, transfer_optimizer, expiry_manager
+def initialize_system():
+    """Lazy initialization - only runs when first API call is made."""
+    global data, predictor, optimizer, restock_engine, transfer_optimizer, expiry_manager, _initialized
+    
+    if _initialized:
+        return
     
     logger.info("Initializing Dark Store Optimization System...")
     
@@ -67,6 +70,7 @@ async def startup_event():
     logger.info("Initializing expiry manager...")
     expiry_manager = ExpiryManager(data['inventory'], data['products'])
     
+    _initialized = True
     logger.info("System ready!")
 
 
@@ -77,9 +81,10 @@ class PredictDemandRequest(BaseModel):
     day_of_week: Optional[int] = None
 
 
-@app.get("/")
+@app.get("/", tags=["System"])
 async def root():
     """Root endpoint."""
+    initialize_system()
     return {
         "service": "Dark Store Supply Chain Optimization API",
         "version": "1.0.0",
@@ -96,15 +101,8 @@ async def root():
 
 @app.post("/predict-demand", tags=["Demand Prediction"])
 async def predict_demand(request: PredictDemandRequest):
-    """
-    Predict demand for a specific store-product-time combination.
-    
-    Args:
-        store_id: Store identifier
-        product_id: Product identifier
-        hour: Hour of day (0-23), defaults to current hour
-        day_of_week: Day of week (0-6), defaults to current day
-    """
+    """Predict demand for a specific store-product-time combination."""
+    initialize_system()
     hour = request.hour if request.hour is not None else datetime.now().hour
     day_of_week = request.day_of_week if request.day_of_week is not None else datetime.now().weekday()
     
@@ -137,7 +135,7 @@ async def predict_demand_batch(
     hours_ahead: int = Query(4, description="Number of hours to predict")
 ):
     """Predict demand for multiple hours ahead."""
-    current_hour = datetime.now().hour
+    initialize_system()
     current_day = datetime.now().weekday()
     
     predictions = []
@@ -166,23 +164,15 @@ async def inventory_status(
     store_id: Optional[int] = Query(None, description="Filter by store ID"),
     status_filter: Optional[str] = Query(None, description="Filter by status: STOCKOUT_RISK, LOW_STOCK, HEALTHY, OVERSTOCK")
 ):
-    """
-    Get current inventory status with predicted demand comparison.
+    """Get current inventory status with predicted demand comparison."""
+    initialize_system()
+    stock_status = optimizer.analyze_stock_status()
     
-    Status values:
-    - STOCKOUT_RISK: Stock is below predicted demand
-    - LOW_STOCK: Stock coverage less than 2 hours
-    - HEALTHY: Stock is adequate
-    - OVERSTOCK: Stock excessive (coverage > 10 hours)
-    """
-    try:
-        stock_status = optimizer.analyze_stock_status()
-        
-        if store_id:
-            stock_status = stock_status[stock_status['store_id'] == store_id]
-        
-        if status_filter:
-            stock_status = stock_status[stock_status['status'] == status_filter]
+    if store_id:
+        stock_status = stock_status[stock_status['store_id'] == store_id]
+    
+    if status_filter:
+        stock_status = stock_status[stock_status['status'] == status_filter]
         
         stock_status = stock_status.merge(
             data['products'][['product_id', 'product_name', 'category']],
@@ -200,14 +190,12 @@ async def inventory_status(
             "items": stock_status.to_dict('records'),
             "timestamp": datetime.now().isoformat()
         }
-    except Exception as e:
-        logger.error(f"Inventory status error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/inventory-status/summary", tags=["Inventory"])
 async def inventory_summary():
     """Get inventory summary statistics."""
+    initialize_system()
     summary = optimizer.get_inventory_summary()
     return summary
 
@@ -217,45 +205,148 @@ async def restock_recommendation(
     store_id: Optional[int] = Query(None, description="Filter by store ID"),
     threshold: float = Query(1.5, description="Threshold multiplier for restock calculation")
 ):
-    """
-    Get restock recommendations for items at risk.
+    """Get restock recommendations for items at risk."""
+    initialize_system()
+    recommendations = optimizer.get_restock_recommendations(threshold_multiplier=threshold)
     
-    Returns items where current stock is less than predicted demand,
-    with recommended order quantities.
-    """
-    try:
-        recommendations = optimizer.get_restock_recommendations(threshold_multiplier=threshold)
-        
-        if store_id:
-            recommendations = recommendations[recommendations['store_id'] == store_id]
-        
-        return {
-            "total_recommendations": len(recommendations),
-            "perishable_items": int(recommendations['is_perishable'].sum()),
-            "recommendations": recommendations.to_dict('records'),
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        logger.error(f"Restock recommendation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    if store_id:
+        recommendations = recommendations[recommendations['store_id'] == store_id]
+    
+    return {
+        "total_recommendations": len(recommendations),
+        "perishable_items": int(recommendations['is_perishable'].sum()),
+        "recommendations": recommendations.to_dict('records'),
+        "timestamp": datetime.now().isoformat()
+    }
 
 
 @app.get("/restock-alerts", tags=["Restocking"])
+async def restock_alerts(store_id: Optional[int] = Query(None)):
+    """Get active restock alerts with priority levels."""
+    initialize_system()
+    alerts = restock_engine.check_restock_needs(store_id)
+    return {
+        "total_alerts": len(alerts),
+        "critical": len([a for a in alerts if a['priority'] == 'CRITICAL']),
+        "warning": len([a for a in alerts if a['priority'] == 'WARNING']),
+        "alerts": alerts,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
 @app.post("/restock-order", tags=["Restocking"])
+async def create_restock_order(
+    store_id: int = Query(..., description="Store ID"),
+    product_id: int = Query(..., description="Product ID")
+):
+    """Generate a restock order for a specific item."""
+    initialize_system()
+    order = restock_engine.generate_restock_order(store_id, product_id)
+    if 'error' in order:
+        raise HTTPException(status_code=404, detail=order['error'])
+    return {"order": order, "timestamp": datetime.now().isoformat()}
+
+
 @app.get("/transfer-suggestions", tags=["Transfers"])
+async def transfer_suggestions(
+    product_id: Optional[int] = Query(None),
+    max_transfers: int = Query(20),
+    optimize_distance: bool = Query(False)
+):
+    """Get inter-store transfer suggestions."""
+    initialize_system()
+    try:
+        if optimize_distance:
+            transfers = transfer_optimizer.optimize_transfers_with_distance(max_distance_km=10)
+        else:
+            transfers = transfer_optimizer.suggest_transfers(product_id, max_transfers)
+        return {
+            "total_transfers": len(transfers),
+            "total_units": sum(t['transfer_quantity'] for t in transfers),
+            "transfers": transfers,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/transfer-summary", tags=["Transfers"])
+async def transfer_summary():
+    """Get summary of all transfer recommendations."""
+    initialize_system()
+    return transfer_optimizer.get_transfer_summary()
+
+
 @app.get("/surplus-deficit-analysis", tags=["Transfers"])
+async def surplus_deficit_analysis(product_id: Optional[int] = Query(None)):
+    """Get detailed surplus/deficit analysis."""
+    initialize_system()
+    analysis = transfer_optimizer.calculate_surplus_deficit(product_id)
+    return {
+        "items_analyzed": len(analysis),
+        "surplus_stores": int((analysis['status'] == 'SURPLUS').sum()),
+        "deficit_stores": int((analysis['status'] == 'DEFICIT').sum()),
+        "balanced_stores": int((analysis['status'] == 'BALANCED').sum()),
+        "analysis": analysis.to_dict('records')
+    }
+
+
 @app.get("/expiry-predictions", tags=["Expiry"])
+async def expiry_predictions(days_threshold: int = Query(3)):
+    """Get expiry predictions for perishable items."""
+    initialize_system()
+    expiry_data = expiry_manager.get_expiry_predictions()
+    return {
+        "total_perishable_items": len(expiry_data),
+        "items": expiry_data.to_dict('records') if not expiry_data.empty else [],
+        "timestamp": datetime.now().isoformat()
+    }
+
+
 @app.get("/clearance-recommendations", tags=["Expiry"])
+async def clearance_recommendations(days_threshold: int = Query(3)):
+    """Get clearance/discount recommendations."""
+    initialize_system()
+    clearance = expiry_manager.get_clearance_recommendations(days_threshold)
+    if clearance.empty:
+        return {"message": "No items require immediate clearance", "recommendations": []}
+    return {
+        "total_items": len(clearance),
+        "total_units": int(clearance['stock_level'].sum()),
+        "total_value_at_discount": round(clearance['total_value_at_discount'].sum(), 2),
+        "recommendations": clearance.to_dict('records'),
+        "timestamp": datetime.now().isoformat()
+    }
+
+
 @app.get("/expiry-summary", tags=["Expiry"])
+async def expiry_summary():
+    """Get summary of expiry situation."""
+    initialize_system()
+    return expiry_manager.get_expiry_summary()
+
+
 @app.get("/model/metrics", tags=["Demand Prediction"])
+async def model_metrics():
+    """Get model training metrics."""
+    initialize_system()
+    return {"feature_importance": predictor.get_feature_importance(), "is_trained": predictor.is_trained}
+
+
 @app.get("/stores", tags=["Catalog"])
+async def get_stores():
+    """Get all store information."""
+    initialize_system()
+    return {"stores": data['stores'].to_dict('records'), "total": len(data['stores'])}
+
+
 @app.get("/products", tags=["Catalog"])
 async def get_products(
     category: Optional[str] = Query(None, description="Filter by category"),
     perishable_only: bool = Query(False, description="Filter only perishable items")
 ):
     """Get product catalog."""
+    initialize_system()
     products = data['products'].copy()
     
     if category:
