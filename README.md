@@ -55,6 +55,30 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+## ☁️ Deploy to Cloud (Free)
+
+### Render.com (Recommended - Free)
+1. Go to [dashboard.render.com](https://dashboard.render.com)
+2. Sign up with GitHub
+3. Click "New" → "Web Service"
+4. Select your `Darkstore-supply-chain-ai` repo
+5. Configure:
+   - Name: `dark-store-ai`
+   - Region: `Oregon` (free)
+   - Start Command: `uvicorn api:app --host 0.0.0.0 --port $PORT`
+6. Click "Create Web Service"
+
+**Demo URL**: `https://dark-store-ai.onrender.com/docs`
+
+### Railway
+```bash
+# Install railway CLI
+npm i -g @railway/cli
+railway login
+railway init
+railway up
+```
+
 ## 🎯 Quick Start
 
 ### Run the Full System
